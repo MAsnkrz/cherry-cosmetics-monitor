@@ -14,7 +14,7 @@ permissions:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 120   # 2hr timeout for initial full-store crawl
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repo
@@ -26,16 +26,12 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install playwright requests beautifulsoup4
-
-      - name: Install Playwright browsers
-        run: python -m playwright install chromium --with-deps
+        run: pip install requests
 
       - name: Run monitor
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           RUN_ONCE: "true"
-          HEADLESS: "true"
         run: python cherry_cosmetics_monitor.py
 
       - name: Commit updated snapshot
