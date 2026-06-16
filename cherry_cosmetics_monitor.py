@@ -35,7 +35,7 @@ HEADLESS       = os.getenv("HEADLESS", "true").lower() == "true"
 
 DISCORD_WEBHOOK = os.getenv(
     "DISCORD_WEBHOOK",
-    "https://discord.com/api/webhooks/1516406785177817289/lJRkTNmGN7iNR4fq8eCqvuc68poiC7-nbs5NOK3mGRdxYYNvmrw_YMlzThHmpuP9dkBd"
+    "YOUR_DISCORD_WEBHOOK_HERE"
 )
 
 # Discord embed colours
@@ -151,7 +151,24 @@ def scrape_listing_page(context, page_num):
     return products, has_next
 
 
+def scrape_all_products(context):
+    """Paginate through the ENTIRE store (for initial snapshot). Returns all products."""
+    all_products = []
+    page_num = 1
+    while True:
+        print(f"  Fetching shop page {page_num}...")
+        products, has_next = scrape_listing_page(context, page_num)
+        all_products.extend(products)
+        print(f"    {len(products)} products found (total so far: {len(all_products)})")
+        if not has_next or not products:
+            break
+        page_num += 1
+        time.sleep(REQUEST_DELAY + random.uniform(1, 3))
+    return all_products
+
+
 def scrape_new_arrivals(context, max_pages=3):
+    """Scrape only the first N pages sorted by date (for incremental checks)."""
     all_products = []
     for page_num in range(1, max_pages + 1):
         print(f"  Fetching shop page {page_num} (newest first)...")
@@ -515,46 +532,80 @@ def run_check():
         try:
             snapshot    = load_snapshot()
             known_slugs = set(snapshot.keys())
+            is_first_run = len(known_slugs) == 0
 
-            # 1. Scrape latest new arrivals
-            latest = scrape_new_arrivals(context, max_pages=3)
-            if not latest:
-                print("  [!] No products scraped")
-                return
+            if is_first_run:
+                # ----------------------------------------------------------------
+                # FIRST RUN: crawl the entire store to build a complete snapshot.
+                # No Discord alerts fired — we just record everything as baseline.
+                # ----------------------------------------------------------------
+                print("  First run detected — crawling entire store for baseline snapshot...")
+                all_products = scrape_all_products(context)
+                print(f"  Found {len(all_products)} products across the whole store")
+                print(f"  Fetching detail for each product (this will take a while)...")
 
-            current_slugs = {p["slug"] for p in latest}
-            new_slugs     = current_slugs - known_slugs
-            print(f"  {len(latest)} products on latest pages, {len(new_slugs)} new")
+                for i, product in enumerate(all_products, 1):
+                    slug = product["slug"]
+                    print(f"  [{i}/{len(all_products)}] {product['title'][:55]}")
+                    time.sleep(REQUEST_DELAY + random.uniform(0, 2))
+                    product = scrape_product_detail(context, slug, existing=product)
+                    entry = snapshot_entry(product)
+                    entry["first_seen"] = datetime.now(timezone.utc).isoformat()
+                    snapshot[slug] = entry
 
-            # 2. New products
-            for product in latest:
-                slug = product["slug"]
-                if slug not in new_slugs:
-                    continue
-                print(f"  -> NEW: {product['title'][:60]}")
-                time.sleep(REQUEST_DELAY + random.uniform(0, 2))
-                product = scrape_product_detail(context, slug, existing=product)
-                notify_new(product)
-                time.sleep(1.5)
-                entry = snapshot_entry(product)
-                entry["first_seen"] = datetime.now(timezone.utc).isoformat()
-                snapshot[slug] = entry
+                    # Save incrementally every 50 products in case of crash
+                    if i % 50 == 0:
+                        save_snapshot(snapshot)
+                        print(f"  Auto-saved snapshot at {i} products")
 
-            # 3. Check all known products for changes
-            print(f"  Checking {len(snapshot)} tracked products for changes...")
-            for slug, old in list(snapshot.items()):
-                time.sleep(REQUEST_DELAY + random.uniform(0, 1.5))
-                product = scrape_product_detail(
-                    context, slug,
-                    existing={"slug": slug, "url": old.get("url", f"{BASE_URL}/product/{slug}/")}
-                )
-                check_changes(product, old)
-                entry = snapshot_entry(product)
-                entry["first_seen"] = old.get("first_seen", entry["first_seen"])
-                snapshot[slug] = entry
+                save_snapshot(snapshot)
+                print(f"  Baseline snapshot complete — {len(snapshot)} products recorded")
+                print(f"  No Discord alerts sent (first run baseline only)")
 
-            save_snapshot(snapshot)
-            print(f"  Snapshot saved ({len(snapshot)} products tracked)")
+            else:
+                # ----------------------------------------------------------------
+                # SUBSEQUENT RUNS: check new arrivals + monitor known products
+                # ----------------------------------------------------------------
+
+                # 1. Scrape latest pages for new arrivals
+                latest = scrape_new_arrivals(context, max_pages=3)
+                if not latest:
+                    print("  [!] No products scraped")
+                    return
+
+                current_slugs = {p["slug"] for p in latest}
+                new_slugs     = current_slugs - known_slugs
+                print(f"  {len(latest)} products on latest pages, {len(new_slugs)} new")
+
+                # 2. Notify and snapshot new products
+                for product in latest:
+                    slug = product["slug"]
+                    if slug not in new_slugs:
+                        continue
+                    print(f"  -> NEW: {product['title'][:60]}")
+                    time.sleep(REQUEST_DELAY + random.uniform(0, 2))
+                    product = scrape_product_detail(context, slug, existing=product)
+                    notify_new(product)
+                    time.sleep(1.5)
+                    entry = snapshot_entry(product)
+                    entry["first_seen"] = datetime.now(timezone.utc).isoformat()
+                    snapshot[slug] = entry
+
+                # 3. Re-check all known products for price/stock changes
+                print(f"  Checking {len(snapshot)} tracked products for changes...")
+                for slug, old in list(snapshot.items()):
+                    time.sleep(REQUEST_DELAY + random.uniform(0, 1.5))
+                    product = scrape_product_detail(
+                        context, slug,
+                        existing={"slug": slug, "url": old.get("url", f"{BASE_URL}/product/{slug}/")}
+                    )
+                    check_changes(product, old)
+                    entry = snapshot_entry(product)
+                    entry["first_seen"] = old.get("first_seen", entry["first_seen"])
+                    snapshot[slug] = entry
+
+                save_snapshot(snapshot)
+                print(f"  Snapshot saved ({len(snapshot)} products tracked)")
 
         finally:
             browser.close()
