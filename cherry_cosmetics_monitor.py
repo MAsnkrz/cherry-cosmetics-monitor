@@ -19,6 +19,7 @@ import time
 import random
 import requests
 from datetime import datetime, timezone
+from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -165,6 +166,38 @@ def parse_product(item):
         "categories": ", ".join(cats),
     }
 
+
+
+
+def scrape_stock_from_page(url, retries=3):
+    """
+    Scrape the actual stock count from the product page HTML.
+    Returns int if found, None if not trackable / page failed.
+    """
+    for attempt in range(retries):
+        try:
+            r = SESSION.get(url, timeout=15)
+            if r.status_code == 429:
+                wait = 20 * (attempt + 1)
+                print(f"  [!] Rate limited scraping stock — waiting {wait}s")
+                time.sleep(wait)
+                continue
+            if not r.ok:
+                return None
+            soup = BeautifulSoup(r.text, "html.parser")
+            text = soup.get_text(" ", strip=True)
+            # "77 in stock" pattern
+            m = re.search(r"(\d+)\s+in\s+stock", text)
+            if m:
+                return int(m.group(1))
+            # Explicitly out of stock
+            if "out of stock" in text.lower():
+                return 0
+            return None
+        except Exception as e:
+            if attempt < retries - 1:
+                time.sleep(3 * (attempt + 1))
+    return None
 
 def fetch_all_products(orderby="date", order="desc"):
     """Fetch every product from the API. Returns list of parsed product dicts."""
@@ -499,11 +532,17 @@ def run_check():
 
         for i, product in enumerate(all_products, 1):
             pid = product["id"]
+            # Scrape actual stock count from the product page
+            stock = scrape_stock_from_page(product["url"])
+            if stock is not None:
+                product["stock"] = stock
+                product["in_stock"] = stock > 0
             entry = snapshot_entry(product)
             entry["first_seen"] = datetime.now(timezone.utc).isoformat()
             snapshot[pid] = entry
+            time.sleep(REQUEST_DELAY + random.uniform(0, 1))
 
-            if i % 100 == 0:
+            if i % 50 == 0:
                 save_snapshot(snapshot)
                 print(f"  Auto-saved at {i}/{len(all_products)} products")
 
@@ -527,23 +566,14 @@ def run_check():
         # Safety cap: if somehow the snapshot is missing most products
         # (e.g. partial first run), don't spam Discord with hundreds of alerts.
         # Only fire new alerts if the number of "new" products is small (<=10).
-        if len(new_ids) > 10:
-            print(f"  [!] {len(new_ids)} new IDs detected — too many to be genuine new arrivals.")
-            print(f"  [!] Treating as snapshot gap, recording without sending Discord alerts.")
-            for product in all_products:
+        for product in all_products:
                 pid = product["id"]
-                if pid not in snapshot:
-                    entry = snapshot_entry(product)
-                    entry["first_seen"] = datetime.now(timezone.utc).isoformat()
-                    snapshot[pid] = entry
-                else:
-                    old_entry = snapshot[pid]
-                    entry = snapshot_entry(product)
-                    entry["first_seen"] = old_entry.get("first_seen", entry["first_seen"])
-                    snapshot[pid] = entry
-        else:
-            for product in all_products:
-                pid = product["id"]
+                # Scrape actual stock count from product page
+                stock = scrape_stock_from_page(product["url"])
+                if stock is not None:
+                    product["stock"] = stock
+                    product["in_stock"] = stock > 0
+                time.sleep(REQUEST_DELAY + random.uniform(0, 1))
 
                 if pid in new_ids:
                     print(f"  -> NEW: {product['title'][:60]}")
