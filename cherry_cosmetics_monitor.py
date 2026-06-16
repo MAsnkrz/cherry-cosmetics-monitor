@@ -128,9 +128,11 @@ def parse_product(item):
             pass
 
     # Stock
-    stock_status = item.get("stock_status", "")
-    stock_qty    = item.get("stock_quantity")   # may be None if not tracked
-    in_stock     = stock_status == "instock"
+    # stock_status: "instock" | "outofstock" | "onbackorder"
+    # stock_quantity: integer if tracked, None if not tracked (status-only mode)
+    stock_status = item.get("stock_status", "instock")
+    stock_qty    = item.get("stock_quantity")   # None = not tracked per-unit
+    in_stock     = stock_status in ("instock", "onbackorder")
 
     # Barcode / EAN — in description or short_description
     desc = item.get("description", "") or ""
@@ -240,7 +242,12 @@ def _base_fields(product):
     cats      = product.get("categories", "")
     sas_url   = selleramp_url(barcode, per_unit or effective_price(product))
 
-    stock_val = f"**{stock} units**" if stock is not None else ("In stock" if in_stock else "Out of stock")
+    if stock is not None:
+        stock_val = f"**{stock} units**"
+    elif in_stock:
+        stock_val = "✅ In stock"
+    else:
+        stock_val = "❌ Out of stock"
 
     fields = [
         {"name": "📦 Pack Size",     "value": f"{pack_size} units",              "inline": True},
@@ -450,8 +457,11 @@ def check_changes(product, old):
         notify_back_in_stock(product)
         time.sleep(1)
     elif was_in_stock and not now_in_stock:
-        notify_oos(product)
-        time.sleep(1)
+        # Only fire OOS if the product actually has quantity tracking
+        # (avoid false OOS alerts for status-only products)
+        if old.get("stock") is not None or product.get("stock") is not None:
+            notify_oos(product)
+            time.sleep(1)
     elif old_f and new_f and new_f < old_f - 0.01:
         notify_price_change(product, old_price, new_price, is_drop=True)
         time.sleep(1)
@@ -514,22 +524,40 @@ def run_check():
         new_ids     = current_ids - known_ids
         print(f"  {len(all_products)} products fetched, {len(new_ids)} new")
 
-        for product in all_products:
-            pid = product["id"]
+        # Safety cap: if somehow the snapshot is missing most products
+        # (e.g. partial first run), don't spam Discord with hundreds of alerts.
+        # Only fire new alerts if the number of "new" products is small (<=10).
+        if len(new_ids) > 10:
+            print(f"  [!] {len(new_ids)} new IDs detected — too many to be genuine new arrivals.")
+            print(f"  [!] Treating as snapshot gap, recording without sending Discord alerts.")
+            for product in all_products:
+                pid = product["id"]
+                if pid not in snapshot:
+                    entry = snapshot_entry(product)
+                    entry["first_seen"] = datetime.now(timezone.utc).isoformat()
+                    snapshot[pid] = entry
+                else:
+                    old_entry = snapshot[pid]
+                    entry = snapshot_entry(product)
+                    entry["first_seen"] = old_entry.get("first_seen", entry["first_seen"])
+                    snapshot[pid] = entry
+        else:
+            for product in all_products:
+                pid = product["id"]
 
-            if pid in new_ids:
-                print(f"  -> NEW: {product['title'][:60]}")
-                notify_new(product)
-                time.sleep(1.5)
-                entry = snapshot_entry(product)
-                entry["first_seen"] = datetime.now(timezone.utc).isoformat()
-                snapshot[pid] = entry
-            else:
-                old = snapshot[pid]
-                check_changes(product, old)
-                entry = snapshot_entry(product)
-                entry["first_seen"] = old.get("first_seen", entry["first_seen"])
-                snapshot[pid] = entry
+                if pid in new_ids:
+                    print(f"  -> NEW: {product['title'][:60]}")
+                    notify_new(product)
+                    time.sleep(1.5)
+                    entry = snapshot_entry(product)
+                    entry["first_seen"] = datetime.now(timezone.utc).isoformat()
+                    snapshot[pid] = entry
+                else:
+                    old_entry = snapshot[pid]
+                    check_changes(product, old_entry)
+                    entry = snapshot_entry(product)
+                    entry["first_seen"] = old_entry.get("first_seen", entry["first_seen"])
+                    snapshot[pid] = entry
 
         save_snapshot(snapshot)
         print(f"  Snapshot saved ({len(snapshot)} products tracked)")
