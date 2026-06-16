@@ -35,7 +35,7 @@ HEADLESS       = os.getenv("HEADLESS", "true").lower() == "true"
 
 DISCORD_WEBHOOK = os.getenv(
     "DISCORD_WEBHOOK",
-    "YOUR_DISCORD_WEBHOOK_HERE"
+    "https://discord.com/api/webhooks/1516406785177817289/lJRkTNmGN7iNR4fq8eCqvuc68poiC7-nbs5NOK3mGRdxYYNvmrw_YMlzThHmpuP9dkBd"
 )
 
 # Discord embed colours
