@@ -1,17 +1,28 @@
 """
-Cherry Cosmetics Monitor
-Uses the WooCommerce Store API (no auth needed) for clean paginated JSON.
+Cherry Cosmetics Monitor — Clean Rewrite
+Monitors https://www.cherrycosmetics.co.uk via WooCommerce Store API
 
-API: https://www.cherrycosmetics.co.uk/wp-json/wc/store/v1/products
+Alerts on:
+  🆕 New listings (in stock only)
+  🟢 Back in stock (was OOS, now in stock)
+  📦 Restock (stock increased meaningfully)
+  📉 Price drops (>1% AND >£0.02)
 
-Detects (Discord alerts fire ONLY for these):
-  - New product listings (in stock only)
-  - Price drops (decreased >1% and >£0.02)
-  - Restocks (stock increased meaningfully) / Back in stock
+Key fixes over previous version:
+  - No more scraping every product page on every run (was causing timeouts)
+  - WooCommerce API provides stock, price, barcode — no page scrapes needed
+  - Only scrapes detail pages for NEW products (to get barcode if missing from API)
+  - Back in stock: scrapes detail page if barcode missing from snapshot
+  - Baseline flag file for reliable first-run detection
+  - Atomic snapshot saves — crash-safe
+  - SAS EAN + SAS Title links using inc-VAT unit price
 
-Does NOT alert on: price increases, stock decreases, going OOS.
+Env vars:
+  DISCORD_WEBHOOK   required
+  CHECK_INTERVAL    seconds (default 3600 = 60 min)
+  RUN_ONCE          "true" for GitHub Actions
 
-Deps:  pip install requests beautifulsoup4
+Deps: pip install requests beautifulsoup4
 """
 
 import json
@@ -21,6 +32,7 @@ import time
 import random
 import requests
 from datetime import datetime, timezone
+from urllib.parse import quote
 from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------------------
@@ -30,11 +42,11 @@ from bs4 import BeautifulSoup
 BASE_URL       = "https://www.cherrycosmetics.co.uk"
 API_URL        = f"{BASE_URL}/wp-json/wc/store/v1/products"
 SNAPSHOT_FILE  = "snapshot_cherry.json"
-PER_PAGE       = 100        # max per page for the store API
-REQUEST_DELAY  = 1.5        # seconds between API calls
+BASELINE_FLAG  = "baseline_done_cherry.txt"
+PER_PAGE       = 100
+REQUEST_DELAY  = 1.5
 RUN_ONCE       = os.getenv("RUN_ONCE", "false").lower() == "true"
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "3600"))  # 1 hour
-
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "3600"))
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 
 HEADERS = {
@@ -46,28 +58,21 @@ HEADERS = {
     "Accept": "application/json",
 }
 
-# Discord embed colours
-COLOUR_NEW     = 0xE91E8C   # pink — new listing
-COLOUR_RESTOCK = 0x3498DB   # blue — restock
-COLOUR_BACK    = 0x9B59B6   # purple — back in stock
-# Price drop colours are tiered by severity — see notify_price_change()
-
-# ---------------------------------------------------------------------------
-# API HELPERS
-# ---------------------------------------------------------------------------
-
 SESSION = requests.Session()
 SESSION.headers.update(HEADERS)
 
+COLOUR_NEW   = 0xE91E8C
+COLOUR_BACK  = 0x9B59B6
+COLOUR_STOCK = 0x3498DB
+COLOUR_DROP  = 0x00C853
 
-def api_get(page, orderby="date", order="desc", retries=3):
-    """Fetch one page of products from the WooCommerce Store API."""
-    params = {
-        "page":     page,
-        "per_page": PER_PAGE,
-        "orderby":  orderby,
-        "order":    order,
-    }
+# ---------------------------------------------------------------------------
+# API — WooCommerce Store API (no auth needed)
+# ---------------------------------------------------------------------------
+
+def api_get(page, retries=3):
+    params = {"page": page, "per_page": PER_PAGE,
+              "orderby": "date", "order": "desc"}
     for attempt in range(retries):
         try:
             r = SESSION.get(API_URL, params=params, timeout=20)
@@ -88,35 +93,31 @@ def api_get(page, orderby="date", order="desc", retries=3):
 
 
 def parse_product(item):
-    """Extract the fields we care about from a Store API product object."""
-    # Price — API returns prices in pence as strings e.g. "1400"
-    def pence_to_pounds(val):
+    """Parse WooCommerce Store API product. No page scraping needed."""
+    def pence(val):
         try:
             return f"{int(val) / 100:.2f}"
         except (TypeError, ValueError):
             return ""
 
-    prices      = item.get("prices", {})
-    raw_price   = prices.get("price", "")
-    raw_regular = prices.get("regular_price", "")
+    prices   = item.get("prices", {})
+    price    = pence(prices.get("price", ""))
+    regular  = pence(prices.get("regular_price", ""))
 
-    price   = pence_to_pounds(raw_price)
-    regular = pence_to_pounds(raw_regular)
-
-    # If price < regular_price it's on sale
     pack_price = regular if regular else price
     sale_price = price if (regular and price != regular) else ""
 
-    # Per unit — shown in short description or name as "£X each"
-    short_desc = item.get("short_description", "") or ""
     name       = item.get("name", "")
-    full_text  = f"{name} {short_desc}"
+    short_desc = item.get("short_description", "") or ""
+    desc       = item.get("description", "") or ""
+    full_text  = f"{name} {short_desc} {desc}"
 
-    pu_m = re.search(r"£([\d.]+)\s*each", full_text)
+    # Per unit from text
+    pu_m     = re.search(r"£([\d.]+)\s*each", full_text, re.IGNORECASE)
     per_unit = pu_m.group(1) if pu_m else ""
 
-    # If no per_unit from text, try to derive from pack size
-    ps_m = re.search(r"[Xx]\s*(\d+)", name)
+    # Pack size from title
+    ps_m      = re.search(r"[Xx]\s*(\d+)", name)
     pack_size = ps_m.group(1) if ps_m else "1"
     if not per_unit and pack_price and pack_size != "1":
         try:
@@ -124,31 +125,42 @@ def parse_product(item):
         except (ValueError, ZeroDivisionError):
             pass
 
-    # Stock
-    # stock_status: "instock" | "outofstock" | "onbackorder"
-    # stock_quantity: integer if tracked, None if not tracked (status-only mode)
+    # Stock — from API directly, no page scrape needed
     stock_status = item.get("stock_status", "instock")
-    stock_qty    = item.get("stock_quantity")   # None = not tracked per-unit
+    stock_qty    = item.get("stock_quantity")
     in_stock     = stock_status in ("instock", "onbackorder")
 
-    # Barcode / EAN — in description or short_description
-    desc = item.get("description", "") or ""
-    ean_m = re.search(r"(?:EAN|Barcode)[^\d]*([0-9]{8,14})", f"{short_desc} {desc}", re.IGNORECASE)
+    # Barcode from description text
+    ean_m = re.search(
+        r"(?:EAN|Barcode|GTIN)[^\d]*([0-9]{8,14})",
+        full_text, re.IGNORECASE
+    )
     if not ean_m:
-        ean_m = re.search(r"\b([0-9]{13})\b", f"{short_desc} {desc}")
+        ean_m = re.search(r"\b([0-9]{13})\b", full_text)
     barcode = ean_m.group(1) if ean_m else ""
 
     # Image
     images = item.get("images", [])
     image  = images[0].get("src", "") if images else ""
 
-    # Categories
-    cats = [c.get("name", "") for c in item.get("categories", [])]
+    # Brand from categories
+    cats  = [c.get("name", "") for c in item.get("categories", [])]
+    brand = ""
+    known_brands = ["Rimmel","L'Oreal","Maybelline","Max Factor","NYX","Barry M",
+                    "Essie","Revlon","Bourjois","Schwarzkopf","Garnier","Dove",
+                    "Nivea","Sally Hansen","OPI"]
+    for b in known_brands:
+        if b.lower() in name.lower():
+            brand = b
+            break
+    if not brand and cats:
+        brand = cats[-1]
 
     return {
         "id":         str(item.get("id", "")),
         "slug":       item.get("slug", ""),
         "title":      name,
+        "brand":      brand,
         "url":        item.get("permalink", f"{BASE_URL}/product/{item.get('slug', '')}/"),
         "image":      image,
         "barcode":    barcode,
@@ -163,140 +175,97 @@ def parse_product(item):
     }
 
 
-
-
-def scrape_stock_from_page(url, retries=3):
-    """
-    Scrape the actual stock count from the product page HTML.
-    Returns int if found, None if not trackable / page failed.
-    """
-    for attempt in range(retries):
-        try:
-            r = SESSION.get(url, timeout=15)
-            if r.status_code == 429:
-                wait = 20 * (attempt + 1)
-                print(f"  [!] Rate limited scraping stock — waiting {wait}s")
-                time.sleep(wait)
-                continue
-            if not r.ok:
-                return None
-            soup = BeautifulSoup(r.text, "html.parser")
-            text = soup.get_text(" ", strip=True)
-            # "77 in stock" pattern
-            m = re.search(r"(\d+)\s+in\s+stock", text)
-            if m:
-                return int(m.group(1))
-            # Explicitly out of stock
-            if "out of stock" in text.lower():
-                return 0
-            return None
-        except Exception as e:
-            if attempt < retries - 1:
-                time.sleep(3 * (attempt + 1))
-    return None
-
-def fetch_all_products(orderby="date", order="desc"):
-    """Fetch every product from the API. Returns list of parsed product dicts."""
-    print(f"  Fetching page 1...")
-    items, total_pages, total_items = api_get(1, orderby=orderby, order=order)
+def fetch_all_products():
+    """Fetch all products from WooCommerce Store API."""
+    items, total_pages, total_items = api_get(1)
     if not items:
         return []
-
-    print(f"  {total_items} total products across {total_pages} pages")
+    print(f"  {total_items} products across {total_pages} pages")
     all_products = [parse_product(i) for i in items]
 
     for page in range(2, total_pages + 1):
-        time.sleep(REQUEST_DELAY + random.uniform(0, 1))
-        print(f"  Fetching page {page}/{total_pages}...")
-        items, _, _ = api_get(page, orderby=orderby, order=order)
+        time.sleep(REQUEST_DELAY + random.uniform(0, 0.5))
+        items, _, _ = api_get(page)
         all_products.extend([parse_product(i) for i in items])
+        print(f"  Page {page}/{total_pages}: total {len(all_products)}")
 
     return all_products
 
 
-def fetch_recent_products(pages=1):
-    """Fetch just the most recent pages (for incremental new arrival checks)."""
-    all_products = []
-    for page in range(1, pages + 1):
-        items, total_pages, _ = api_get(page, orderby="date", order="desc")
-        all_products.extend([parse_product(i) for i in items])
-        if page >= total_pages:
-            break
-        time.sleep(REQUEST_DELAY)
-    return all_products
+def scrape_barcode_from_page(url):
+    """
+    Scrape a product page ONLY to find the EAN/barcode.
+    Called for new products or back-in-stock products with no cached barcode.
+    NOT called on every run for every product.
+    """
+    try:
+        r = SESSION.get(url, timeout=15)
+        if not r.ok:
+            return ""
+        soup = BeautifulSoup(r.text, "html.parser")
+        text = soup.get_text(" ", strip=True)
 
+        # YITH barcode plugin image URL pattern
+        for img in soup.find_all("img", src=re.compile(r"EAN13", re.IGNORECASE)):
+            m = re.search(r"EAN13[_-](\d{8,14})", img.get("src", ""))
+            if m:
+                return m.group(1)
+
+        # Text patterns
+        for pat in [
+            r"(?:EAN|Barcode|GTIN)[^\d]*([0-9]{8,14})",
+            r"\b([0-9]{13})\b",
+        ]:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    return ""
 
 # ---------------------------------------------------------------------------
-# PRICING HELPERS
+# HELPERS
 # ---------------------------------------------------------------------------
 
-def effective_price(product):
-    return product.get("sale_price") or product.get("pack_price") or "0"
-
-
-def vat_price(price_str):
+def safe_float(v):
     try:
-        return f"{float(price_str) * 1.2:.2f}"
-    except (ValueError, TypeError):
-        return price_str
-
-
-def selleramp_url(barcode, cost_price_str):
-    if not barcode:
-        return None
-    return (
-        f"https://sas.selleramp.com/sas/lookup/"
-        f"?search_term={barcode}&sas_cost_price={vat_price(cost_price_str)}"
-    )
-
-
-def safe_float(val):
-    try:
-        return float(val)
+        return float(v)
     except (TypeError, ValueError):
         return None
 
 
+def vat(price_str):
+    f = safe_float(price_str)
+    return f"{f * 1.2:.2f}" if f else price_str
+
+
+def effective_price(product):
+    return product.get("sale_price") or product.get("pack_price") or ""
+
+
+def sas_ean(barcode, cost):
+    if not barcode:
+        return None
+    return (f"https://sas.selleramp.com/sas/lookup/"
+            f"?search_term={barcode}&sas_cost_price={vat(cost)}")
+
+
+def sas_title(title, cost):
+    return (f"https://sas.selleramp.com/sas/lookup/"
+            f"?search_term={quote(title)}&sas_cost_price={vat(cost)}")
+
 # ---------------------------------------------------------------------------
-# DISCORD EMBEDS
+# DISCORD
 # ---------------------------------------------------------------------------
 
-def _base_fields(product):
-    barcode   = product.get("barcode", "")
-    sku       = product.get("sku", "")
-    pack_size = product.get("pack_size", "?")
-    per_unit  = product.get("per_unit", "")
-    stock     = product.get("stock")
-    in_stock  = product.get("in_stock", True)
-    cats      = product.get("categories", "")
-    sas_url   = selleramp_url(barcode, per_unit or effective_price(product))
-
-    if stock is not None:
-        stock_val = f"**{stock} units**"
-    elif in_stock:
-        stock_val = "✅ In stock"
-    else:
-        stock_val = "❌ Out of stock"
-
-    fields = [
-        {"name": "📦 Pack Size",     "value": f"{pack_size} units",              "inline": True},
-        {"name": "🔢 Barcode / EAN", "value": f"`{barcode}`" if barcode else "-", "inline": True},
-        {"name": "🔖 SKU",           "value": f"`{sku}`" if sku else "-",         "inline": True},
-        {"name": "📊 Stock",         "value": stock_val,                          "inline": True},
-    ]
-    if cats:
-        fields.append({"name": "🏷️ Category", "value": cats, "inline": True})
-    if sas_url:
-        fields.append({"name": "🔍 SellerAmp SAS", "value": f"[Open in SellerAmp]({sas_url})", "inline": False})
-    return fields
-
-
-def _send_embed(embed):
-    payload = {"embeds": [embed]}
+def _send(payload):
+    if not DISCORD_WEBHOOK:
+        return
     try:
         r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
         if r.status_code == 429:
             wait = float(r.json().get("retry_after", 5)) + 0.5
+            print(f"  [!] Discord rate limited — waiting {wait:.1f}s")
             time.sleep(wait)
             requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
         else:
@@ -305,128 +274,125 @@ def _send_embed(embed):
         print(f"  [!] Discord error: {e}")
 
 
-def _thumbnail(product):
-    image = product.get("image", "")
-    return {"url": image} if image else None
-
-
-def _price_display(product):
-    pack_price = product.get("pack_price", "")
-    sale_price = product.get("sale_price", "")
-    if sale_price:
-        return f"£{pack_price} -> **£{sale_price}**"
-    return f"**£{pack_price}**" if pack_price else "-"
-
-
-def notify_new(product):
-    per_unit = product.get("per_unit", "")
-    fields = [
-        {"name": "💰 Pack Price (ex. VAT)", "value": _price_display(product),                        "inline": True},
-        {"name": "💷 Per Unit (ex. VAT)",   "value": f"£{per_unit}" if per_unit else "-",            "inline": True},
-        {"name": "💷 Per Unit (inc. VAT)",  "value": f"£{vat_price(per_unit)}" if per_unit else "-", "inline": True},
-    ] + _base_fields(product)
-
-    embed = {
-        "title":     f"🆕  NEW LISTING — {product.get('title', '')}",
-        "url":       product.get("url", BASE_URL),
-        "color":     COLOUR_NEW,
-        "fields":    fields,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "footer":    {"text": "Cherry Cosmetics Monitor • cherrycosmetics.co.uk"},
-    }
-    t = _thumbnail(product)
-    if t: embed["thumbnail"] = t
-    _send_embed(embed)
-    print(f"  Discord: NEW — {product.get('title', '')[:60]}")
-
-
-def notify_price_change(product, old_price, new_price, pct_change):
-    """
-    pct_change is a fraction (e.g. 0.05 = 5% drop). Always a drop —
-    price increases are no longer tracked.
-    Colour tier scales with drop severity for quick visual triage.
-    """
-    old_f = safe_float(old_price)
-    new_f = safe_float(new_price)
-    diff  = f"£{abs(new_f - old_f):.2f}" if old_f and new_f else "?"
-    pct_display = f"{pct_change * 100:.1f}%"
+def _base_fields(product):
+    barcode  = product.get("barcode", "")
+    brand    = product.get("brand", "")
+    sku      = product.get("sku", "")
+    pack_sz  = product.get("pack_size", "")
+    stock    = product.get("stock")
+    in_stock = product.get("in_stock", True)
+    cost     = effective_price(product)
     per_unit = product.get("per_unit", "")
 
-    if pct_change >= 0.20:
-        colour = 0x00C853   # deep green — big drop (20%+)
-        tier   = "🔥"
-    elif pct_change >= 0.10:
-        colour = 0x2ECC71   # green — solid drop (10-20%)
-        tier   = "💰"
-    else:
-        colour = 0x82E0AA   # light green — small drop (1-10%)
-        tier   = "💵"
+    sas_cost = per_unit or cost   # prefer unit price for SAS
+
+    stock_val = (f"{stock:,} units" if stock is not None
+                 else ("✅ In stock" if in_stock else "❌ OOS"))
 
     fields = [
-        {"name": "💰 Old Price",           "value": f"£{old_price}",                                "inline": True},
-        {"name": "💰 New Price",           "value": f"**£{new_price}**",                            "inline": True},
-        {"name": "📉 Drop",                "value": f"↓ {diff} (**{pct_display}**)",                "inline": True},
-        {"name": "💷 Per Unit (ex. VAT)",  "value": f"£{per_unit}" if per_unit else "-",            "inline": True},
-        {"name": "💷 Per Unit (inc. VAT)", "value": f"£{vat_price(per_unit)}" if per_unit else "-", "inline": True},
-    ] + _base_fields(product)
+        {"name": "🏷️ Brand",        "value": brand or "-",                         "inline": True},
+        {"name": "📦 Pack Size",     "value": f"{pack_sz} units" if pack_sz else "-","inline": True},
+        {"name": "🔖 SKU",           "value": f"`{sku}`" if sku else "-",            "inline": True},
+        {"name": "📊 Stock",         "value": stock_val,                             "inline": True},
+        {"name": "🔢 GTIN / EAN",    "value": f"`{barcode}`" if barcode else "-",    "inline": True},
+        {"name": "💷 inc-VAT",       "value": f"£{vat(per_unit)}" if per_unit else "-", "inline": True},
+    ]
 
+    ean_url   = sas_ean(barcode, sas_cost)
+    title_url = sas_title(product.get("title",""), sas_cost)
+    if ean_url:
+        fields.append({"name": "🔍 SAS EAN",   "value": f"[Search by barcode]({ean_url})", "inline": True})
+    fields.append(    {"name": "🔍 SAS Title", "value": f"[Search by title]({title_url})",  "inline": True})
+
+    return fields
+
+
+def _embed(title, url, colour, fields, product, footer_extra=""):
     embed = {
-        "title":     f"{tier}  PRICE DROP -{pct_display} — {product.get('title', '')}",
-        "url":       product.get("url", BASE_URL),
+        "title":     title,
+        "url":       url,
         "color":     colour,
         "fields":    fields,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "footer":    {"text": "Cherry Cosmetics Monitor • cherrycosmetics.co.uk"},
+        "footer":    {"text": f"Cherry Cosmetics Monitor • cherrycosmetics.co.uk{footer_extra}"},
     }
-    t = _thumbnail(product)
-    if t: embed["thumbnail"] = t
-    _send_embed(embed)
-    print(f"  Discord: PRICE DROP -{pct_display} — {product.get('title', '')[:50]}")
+    image = product.get("image", "")
+    if image:
+        embed["thumbnail"] = {"url": image}
+    return embed
 
 
-def notify_stock_change(product, old_stock, new_stock):
-    """Restock only — stock decreases are no longer tracked."""
-    diff = (new_stock - old_stock) if (new_stock is not None and old_stock is not None) else "?"
+def notify_new(product):
+    cost  = effective_price(product)
+    pu    = product.get("per_unit", "")
+    price_val = f"~~£{product['pack_price']}~~ → **£{product['sale_price']}**" \
+                if product.get("sale_price") else f"**£{cost}**"
     fields = [
-        {"name": "📊 Old Stock", "value": f"{old_stock} units",     "inline": True},
-        {"name": "📊 New Stock", "value": f"**{new_stock} units**", "inline": True},
-        {"name": "📈 Change",    "value": f"↑ +{diff} units" if isinstance(diff, int) else "-", "inline": True},
+        {"name": "💰 New Price",       "value": price_val,                     "inline": True},
+        {"name": "💷 Per Unit (ex-VAT)","value": f"£{pu}" if pu else "-",      "inline": True},
     ] + _base_fields(product)
 
-    embed = {
-        "title":     f"🟢  RESTOCK — {product.get('title', '')}",
-        "url":       product.get("url", BASE_URL),
-        "color":     COLOUR_RESTOCK,
-        "fields":    fields,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "footer":    {"text": "Cherry Cosmetics Monitor • cherrycosmetics.co.uk"},
-    }
-    t = _thumbnail(product)
-    if t: embed["thumbnail"] = t
-    _send_embed(embed)
-    print(f"  Discord: RESTOCK — {product.get('title', '')[:50]}")
+    _send({"embeds": [_embed(
+        f"🆕  NEW — {product['title']}",
+        product["url"], COLOUR_NEW, fields, product
+    )]})
+    print(f"  ✅ NEW: {product['title'][:60]}")
 
 
 def notify_back_in_stock(product):
-    per_unit = product.get("per_unit", "")
+    pu    = product.get("per_unit", "")
+    cost  = effective_price(product)
     fields = [
-        {"name": "💷 Per Unit (ex. VAT)",  "value": f"£{per_unit}" if per_unit else "-",            "inline": True},
-        {"name": "💷 Per Unit (inc. VAT)", "value": f"£{vat_price(per_unit)}" if per_unit else "-", "inline": True},
+        {"name": "💰 New Price",        "value": f"**£{cost}**",               "inline": True},
+        {"name": "💷 Per Unit (ex-VAT)","value": f"£{pu}" if pu else "-",      "inline": True},
     ] + _base_fields(product)
 
-    embed = {
-        "title":     f"🟢  BACK IN STOCK — {product.get('title', '')}",
-        "url":       product.get("url", BASE_URL),
-        "color":     COLOUR_BACK,
-        "fields":    fields,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "footer":    {"text": "Cherry Cosmetics Monitor • cherrycosmetics.co.uk"},
-    }
-    t = _thumbnail(product)
-    if t: embed["thumbnail"] = t
-    _send_embed(embed)
-    print(f"  Discord: BACK IN STOCK — {product.get('title', '')[:60]}")
+    _send({"embeds": [_embed(
+        f"🟢  BACK IN STOCK — {product['title']}",
+        product["url"], COLOUR_BACK, fields, product
+    )]})
+    print(f"  ✅ BACK IN STOCK: {product['title'][:55]}")
 
+
+def notify_restock(product, old_stock, new_stock):
+    diff  = new_stock - old_stock if (new_stock and old_stock) else "?"
+    cost  = effective_price(product)
+    pu    = product.get("per_unit", "")
+    fields = [
+        {"name": "📦 Was",   "value": f"{old_stock:,} units",            "inline": True},
+        {"name": "📦 Now",   "value": f"**{new_stock:,} units**",        "inline": True},
+        {"name": "📈 Added", "value": f"+{diff:,}" if isinstance(diff, int) else "?", "inline": True},
+        {"name": "💰 Price", "value": f"£{cost}",                        "inline": True},
+        {"name": "💷 Per Unit (ex-VAT)","value": f"£{pu}" if pu else "-","inline": True},
+    ] + _base_fields(product)
+
+    _send({"embeds": [_embed(
+        f"📦  RESTOCK — {product['title']}",
+        product["url"], COLOUR_STOCK, fields, product
+    )]})
+    print(f"  ✅ RESTOCK: {product['title'][:55]}")
+
+
+def notify_price_drop(product, old_price, new_price, pct):
+    pct_str  = f"{pct*100:.1f}%"
+    abs_drop = safe_float(old_price) - safe_float(new_price)
+    pu       = product.get("per_unit", "")
+    icon     = "🔥" if pct >= 0.20 else ("💰" if pct >= 0.10 else "💵")
+    colour   = 0x00C853 if pct >= 0.20 else (0x2ECC71 if pct >= 0.10 else 0x82E0AA)
+
+    fields = [
+        {"name": "💰 Was",              "value": f"£{old_price}",                     "inline": True},
+        {"name": "💰 Now",              "value": f"**£{new_price}**",                 "inline": True},
+        {"name": "📉 Drop",             "value": f"↓ £{abs_drop:.2f} (-{pct_str})",  "inline": True},
+        {"name": "💷 Per Unit (ex-VAT)","value": f"£{pu}" if pu else "-",            "inline": True},
+    ] + _base_fields(product)
+
+    _send({"embeds": [_embed(
+        f"{icon}  PRICE DROP -{pct_str} — {product['title']}",
+        product["url"], colour, fields, product,
+        footer_extra=f" • was £{old_price}"
+    )]})
+    print(f"  ✅ PRICE DROP -{pct_str}: {product['title'][:45]}")
 
 # ---------------------------------------------------------------------------
 # SNAPSHOT
@@ -434,185 +400,194 @@ def notify_back_in_stock(product):
 
 def load_snapshot():
     if os.path.exists(SNAPSHOT_FILE):
-        with open(SNAPSHOT_FILE) as f:
-            return json.load(f)
+        try:
+            with open(SNAPSHOT_FILE) as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            bak = f"{SNAPSHOT_FILE}.bak.{int(time.time())}"
+            print(f"  [!] Snapshot corrupted — backed up to {bak}")
+            try:
+                os.rename(SNAPSHOT_FILE, bak)
+            except OSError:
+                pass
     return {}
 
 
 def save_snapshot(data):
-    with open(SNAPSHOT_FILE, "w") as f:
+    tmp = SNAPSHOT_FILE + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
+    os.replace(tmp, SNAPSHOT_FILE)
 
 
-def snapshot_entry(product):
+def to_entry(product):
     return {
-        "title":        product.get("title", ""),
-        "url":          product.get("url", ""),
-        "image":        product.get("image", ""),
-        "barcode":      product.get("barcode", ""),
-        "sku":          product.get("sku", ""),
-        "pack_size":    product.get("pack_size", ""),
-        "pack_price":   product.get("pack_price", ""),
-        "sale_price":   product.get("sale_price", ""),
-        "per_unit":     product.get("per_unit", ""),
-        "stock":        product.get("stock"),
-        "in_stock":     product.get("in_stock", True),
-        "categories":   product.get("categories", ""),
-        "first_seen":   product.get("first_seen", datetime.now(timezone.utc).isoformat()),
+        "title":      product.get("title", ""),
+        "url":        product.get("url", ""),
+        "image":      product.get("image", ""),
+        "barcode":    product.get("barcode", ""),
+        "brand":      product.get("brand", ""),
+        "sku":        product.get("sku", ""),
+        "pack_size":  product.get("pack_size", ""),
+        "pack_price": product.get("pack_price", ""),
+        "sale_price": product.get("sale_price", ""),
+        "per_unit":   product.get("per_unit", ""),
+        "stock":      product.get("stock"),
+        "in_stock":   product.get("in_stock", True),
+        "categories": product.get("categories", ""),
+        "first_seen": product.get("first_seen", datetime.now(timezone.utc).isoformat()),
         "last_updated": datetime.now(timezone.utc).isoformat(),
     }
 
-
 # ---------------------------------------------------------------------------
-# CHANGE DETECTION
-# ---------------------------------------------------------------------------
-
-def check_changes(product, old):
-    """
-    Only fires alerts for:
-      - Back in stock (was OOS, now has stock) — takes priority
-      - Restock (stock increased meaningfully while already in stock)
-      - Price drop (decreased by more than 1% AND more than £0.02)
-    No alerts for: price increases, stock decreases, going OOS.
-    """
-    old_price    = old.get("sale_price") or old.get("pack_price") or ""
-    new_price    = product.get("sale_price") or product.get("pack_price") or ""
-    old_stock    = old.get("stock")
-    new_stock    = product.get("stock")
-    was_in_stock = old.get("in_stock", True)
-    now_in_stock = product.get("in_stock", True)
-
-    # Fill cached fields if API didn't return them
-    for key in ("image", "barcode", "sku", "pack_size", "categories"):
-        if not product.get(key):
-            product[key] = old.get(key, "")
-
-    old_f = safe_float(old_price)
-    new_f = safe_float(new_price)
-
-    # Back in stock takes priority over everything else
-    if not was_in_stock and now_in_stock:
-        notify_back_in_stock(product)
-        time.sleep(1)
-        return
-
-    # Price drop — require both a meaningful % AND absolute change
-    if old_f and new_f and old_f > 0:
-        pct_change = (old_f - new_f) / old_f
-        abs_change = old_f - new_f
-        if pct_change > 0.01 and abs_change > 0.02:
-            notify_price_change(product, old_price, new_price, pct_change)
-            time.sleep(1)
-
-    # Restock — only while staying in stock, with a sane threshold to avoid noise
-    if old_stock is not None and new_stock is not None and was_in_stock and now_in_stock:
-        threshold = max(5, int(old_stock * 0.2))
-        if new_stock > old_stock + threshold:
-            notify_stock_change(product, old_stock, new_stock)
-            time.sleep(1)
-
-
-# ---------------------------------------------------------------------------
-# MAIN
+# MAIN CHECK
 # ---------------------------------------------------------------------------
 
 def run_check():
-    print(f"\n[{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}] Checking Cherry Cosmetics...")
+    now_str = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+    print(f"\n[{now_str}] Checking Cherry Cosmetics...")
 
-    snapshot     = load_snapshot()
-    known_ids    = set(snapshot.keys())
-    is_first_run = len(known_ids) == 0
+    snapshot      = load_snapshot()
+    known_ids     = set(snapshot.keys())
+    baseline_done = os.path.exists(BASELINE_FLAG)
+    is_first_run  = not baseline_done
+
+    # Fetch all products from WooCommerce API (fast — no page scrapes)
+    all_products = fetch_all_products()
+    if not all_products:
+        print("  [!] No products returned — skipping")
+        return
+
+    current_ids = {p["id"] for p in all_products}
+    new_ids     = current_ids - known_ids
+    gone_ids    = known_ids - current_ids
+
+    print(f"  {len(all_products)} products | {len(new_ids)} new | {len(gone_ids)} gone")
 
     if is_first_run:
-        # ----------------------------------------------------------------
-        # FIRST RUN: pull entire store via API, build baseline — no alerts
-        # ----------------------------------------------------------------
-        print("  First run — fetching entire store as baseline (no alerts will fire)...")
-        all_products = fetch_all_products(orderby="date", order="desc")
-        print(f"  {len(all_products)} products fetched")
+        print(f"  First run — building baseline. No alerts.")
 
-        for i, product in enumerate(all_products, 1):
-            pid = product["id"]
-            # Scrape actual stock count from the product page
-            stock = scrape_stock_from_page(product["url"])
-            if stock is not None:
-                product["stock"] = stock
-                product["in_stock"] = stock > 0
-            entry = snapshot_entry(product)
+    alerts_sent = 0
+
+    for product in all_products:
+        pid      = product["id"]
+        is_new   = pid in new_ids
+        old      = snapshot.get(pid, {})
+
+        was_in_stock = old.get("in_stock", True)
+        now_in_stock = product.get("in_stock", True)
+        is_back      = not was_in_stock and now_in_stock and not is_new
+
+        # Scrape product page for barcode ONLY when needed:
+        # - New product AND barcode not in API response
+        # - Back in stock AND no barcode in snapshot
+        needs_barcode_scrape = (
+            (is_new and not is_first_run and not product.get("barcode")) or
+            (is_back and not old.get("barcode") and not product.get("barcode"))
+        )
+        if needs_barcode_scrape:
+            time.sleep(REQUEST_DELAY)
+            scraped = scrape_barcode_from_page(product["url"])
+            if scraped:
+                product["barcode"] = scraped
+
+        # Carry forward cached fields for existing products
+        for key in ("barcode", "brand", "image", "sku", "categories"):
+            if not product.get(key):
+                product[key] = old.get(key, "")
+
+        if is_first_run:
+            entry = to_entry(product)
             entry["first_seen"] = datetime.now(timezone.utc).isoformat()
             snapshot[pid] = entry
-            time.sleep(REQUEST_DELAY + random.uniform(0, 1))
+            continue
 
-            if i % 50 == 0:
-                save_snapshot(snapshot)
-                print(f"  Auto-saved at {i}/{len(all_products)} products")
+        # --- ALERTS ---
 
-        save_snapshot(snapshot)
-        print(f"  Baseline complete — {len(snapshot)} products recorded. No Discord alerts sent.")
+        # New product
+        if is_new:
+            if now_in_stock:
+                notify_new(product)
+                alerts_sent += 1
+                time.sleep(1.5)
+            entry = to_entry(product)
+            entry["first_seen"] = datetime.now(timezone.utc).isoformat()
+            snapshot[pid] = entry
+            continue
 
+        # Back in stock
+        if is_back:
+            notify_back_in_stock(product)
+            alerts_sent += 1
+            time.sleep(1.5)
+
+        # Price drop (only if still in stock)
+        elif now_in_stock:
+            old_price = old.get("sale_price") or old.get("pack_price") or ""
+            new_price = product.get("sale_price") or product.get("pack_price") or ""
+            old_f     = safe_float(old_price)
+            new_f     = safe_float(new_price)
+            if old_f and new_f and old_f > 0:
+                pct = (old_f - new_f) / old_f
+                if pct > 0.01 and (old_f - new_f) > 0.02:
+                    notify_price_drop(product, old_price, new_price, pct)
+                    alerts_sent += 1
+                    time.sleep(1.5)
+
+            # Restock (stock went up meaningfully)
+            old_stock = old.get("stock")
+            new_stock = product.get("stock")
+            if (old_stock is not None and new_stock is not None
+                    and new_stock > old_stock + max(5, int(old_stock * 0.2))):
+                notify_restock(product, old_stock, new_stock)
+                alerts_sent += 1
+                time.sleep(1.5)
+
+        # Update snapshot
+        entry = to_entry(product)
+        entry["first_seen"] = old.get("first_seen", entry["first_seen"])
+        snapshot[pid] = entry
+
+    # Mark gone products as OOS
+    for pid in gone_ids:
+        if pid in snapshot:
+            snapshot[pid]["in_stock"] = False
+            snapshot[pid]["last_updated"] = datetime.now(timezone.utc).isoformat()
+
+    save_snapshot(snapshot)
+
+    if is_first_run:
+        with open(BASELINE_FLAG, "w") as f:
+            f.write(datetime.now(timezone.utc).isoformat())
+        print(f"  Baseline saved — {len(snapshot)} products tracked. Monitoring begins next cycle.")
     else:
-        # ----------------------------------------------------------------
-        # SUBSEQUENT RUNS: full store re-fetch and diff against snapshot
-        # ----------------------------------------------------------------
-        print(f"  Fetching full store to check for changes...")
-        all_products = fetch_all_products(orderby="date", order="desc")
-        if not all_products:
-            print("  [!] No products returned from API")
-            return
+        print(f"  Done — {alerts_sent} alert(s) | {len(snapshot)} products tracked.")
 
-        current_ids = {p["id"] for p in all_products}
-        new_ids     = current_ids - known_ids
-        print(f"  {len(all_products)} products fetched, {len(new_ids)} new")
-
-        # Safety cap: if somehow the snapshot is missing most products
-        # (e.g. partial first run), don't spam Discord with hundreds of alerts.
-        # Only fire new alerts if the number of "new" products is small (<=10).
-        for product in all_products:
-                pid = product["id"]
-                # Scrape actual stock count from product page
-                stock = scrape_stock_from_page(product["url"])
-                if stock is not None:
-                    product["stock"] = stock
-                    product["in_stock"] = stock > 0
-                time.sleep(REQUEST_DELAY + random.uniform(0, 1))
-
-                if pid in new_ids:
-                    # Skip Discord alert if product is out of stock — still record it
-                    if product.get("in_stock", True) and (product.get("stock") is None or product.get("stock") > 0):
-                        print(f"  -> NEW: {product['title'][:60]}")
-                        notify_new(product)
-                        time.sleep(1.5)
-                    entry = snapshot_entry(product)
-                    entry["first_seen"] = datetime.now(timezone.utc).isoformat()
-                    snapshot[pid] = entry
-                else:
-                    old_entry = snapshot[pid]
-                    check_changes(product, old_entry)
-                    entry = snapshot_entry(product)
-                    entry["first_seen"] = old_entry.get("first_seen", entry["first_seen"])
-                    snapshot[pid] = entry
-
-        save_snapshot(snapshot)
-        print(f"  Snapshot saved ({len(snapshot)} products tracked)")
-
+# ---------------------------------------------------------------------------
+# ENTRY POINT
+# ---------------------------------------------------------------------------
 
 def main():
     print("=" * 55)
-    print("  Cherry Cosmetics Monitor (WooCommerce Store API)")
-    print(f"  Watching: {API_URL}")
-    print("  Tracking: new listings, price & stock changes")
+    print("  Cherry Cosmetics Monitor")
+    print(f"  API: {API_URL}")
+    print("  Alerts: new listings | back in stock | price drops | restocks")
     print("=" * 55)
+
+    if not DISCORD_WEBHOOK:
+        print("  ⚠️  DISCORD_WEBHOOK not set")
 
     if RUN_ONCE:
         run_check()
-    else:
-        while True:
-            try:
-                run_check()
-            except Exception as e:
-                print(f"  [!] Unexpected error: {e}")
-            print(f"  Sleeping {CHECK_INTERVAL}s...")
-            time.sleep(CHECK_INTERVAL)
+        return
+
+    while True:
+        try:
+            run_check()
+        except Exception as e:
+            print(f"  [!] Unexpected error: {e}")
+        print(f"  Sleeping {CHECK_INTERVAL}s...")
+        time.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
